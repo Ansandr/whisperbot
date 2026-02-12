@@ -25,17 +25,41 @@
 #define MAX_SECONDS 300
 #define MSG_LIMIT 4000
 #define TIMEOUT 600
-#define WHISPER_PATH "/Users/antirez/hack/ai/whisper.cpp/build/bin/whisper-cli"
-#define SHORT_AUDIO_THRESHOLD 1.5  /* Seconds. Below this, use DEFAULT_LANG. */
-#define DEFAULT_LANG "it"          /* Language for short audio. */
+/* Select backend: uncomment exactly one. */
+#define USE_WHISPER
+/* #define USE_QWEN3_ASR */
 
-/* Model selection based on queue length. */
-#define MODEL_BASE "/Users/antirez/hack/ai/whisper.cpp/models/ggml-base.bin"
-#define MODEL_MEDIUM "/Users/antirez/hack/ai/whisper.cpp/models/ggml-medium.bin"
-#define QUEUE_THRESHOLD_BASE 3  /* Use base model when queue >= this */
+#if defined(USE_WHISPER) && defined(USE_QWEN3_ASR)
+#error "Define only one backend: USE_WHISPER or USE_QWEN3_ASR."
+#elif !defined(USE_WHISPER) && !defined(USE_QWEN3_ASR)
+#error "Define one backend: USE_WHISPER or USE_QWEN3_ASR."
+#endif
+
+#ifdef USE_WHISPER
+#define MODEL_BACKEND_NAME "Whisper"
+#define MODEL_BIN_PATH "/Users/antirez/hack/ai/whisper.cpp/build/bin/whisper-cli"
+#define MODEL_FAST "/Users/antirez/hack/ai/whisper.cpp/models/ggml-base.bin"
+#define MODEL_BEST "/Users/antirez/hack/ai/whisper.cpp/models/ggml-medium.bin"
+#define MODEL_FAST_NAME "base"
+#define MODEL_BEST_NAME "medium"
+#define QUEUE_THRESHOLD_FAST 3 /* Use fast model when queue >= this */
+#define SHORT_AUDIO_THRESHOLD 1.5
+#define DEFAULT_LANG "it"
+#endif
+
+#ifdef USE_QWEN3_ASR
+#define MODEL_BACKEND_NAME "Qwen3-ASR"
+#define MODEL_BIN_PATH "/Users/antirez/hack/2026/qwen-asr/qwen_asr"
+#define MODEL_FAST "/Users/antirez/hack/2026/qwen-asr/qwen3-asr-0.6b"
+#define MODEL_BEST "/Users/antirez/hack/2026/qwen-asr/qwen3-asr-1.7b"
+#define MODEL_FAST_NAME "0.6b"
+#define MODEL_BEST_NAME "1.7b"
+#define QUEUE_THRESHOLD_FAST 3 /* Use fast model when queue >= this */
+#endif
+
 #define EDIT_INTERVAL_MS 500    /* Min ms between message edits. */
 
-/* Serialization: only one whisper process at a time. */
+/* Serialization: only one ASR process at a time. */
 atomic_int QueueLen = 0;
 pthread_mutex_t WhisperLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -125,27 +149,29 @@ double getDuration(const char *path) {
     return dur;
 }
 
-/* Convert to 16khz mono WAV. For short audio, pad to 1.5s with silence.
- * Whisper fails on audio < 1s. */
+/* Convert to 16khz mono WAV. */
 int toWav(const char *in, const char *out, double duration) {
+#ifdef USE_WHISPER
     if (duration < SHORT_AUDIO_THRESHOLD) {
-        /* Pad with silence. */
+        /* Pad short clips to improve whisper behavior. */
         char af[64];
         snprintf(af, sizeof(af), "apad=whole_dur=%.1f", SHORT_AUDIO_THRESHOLD);
         return runCommand(NULL, "ffmpeg", "-y", "-i", in, "-af", af,
                           "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
                           out, NULL);
     }
+#else
+    UNUSED(duration);
+#endif
     return runCommand(NULL, "ffmpeg", "-y", "-i", in,
                       "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
                       out, NULL);
 }
 
-/* Run whisper with timeout. Streams output to Telegram by editing 'msg_id'.
- * For short audio, use DEFAULT_LANG instead of auto-detect.
- * Returns 0 on success, -1 on error. */
-int whisper(const char *wav, const char *model, int64_t target,
-            int64_t chat_id, int64_t msg_id, int short_audio)
+/* Run selected ASR backend with timeout. Streams output to Telegram by
+ * editing 'msg_id'. Returns 0 on success, -1 on error. */
+int transcribe(const char *wav, const char *model, int64_t target,
+               int64_t chat_id, int64_t msg_id, int short_audio)
 {
     int fd[2];
     if (pipe(fd) == -1) return -1;
@@ -160,14 +186,26 @@ int whisper(const char *wav, const char *model, int64_t target,
     if (pid == 0) {
         close(fd[0]);
         dup2(fd[1], STDOUT_FILENO);
+#ifdef USE_WHISPER
         dup2(fd[1], STDERR_FILENO);
         close(fd[1]);
         const char *lang = short_audio ? DEFAULT_LANG : "auto";
-        execlp(WHISPER_PATH, "whisper-cli",
+        execlp(MODEL_BIN_PATH, "whisper-cli",
                "-m", model,
                "-f", wav,
                "-l", lang,
-               "-np", "-nt", NULL);
+               "-t", "20", "-np", "-nt", NULL);
+#endif
+#ifdef USE_QWEN3_ASR
+        UNUSED(short_audio);
+        close(fd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull != -1) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        execlp(MODEL_BIN_PATH, "qwen_asr",
+               "-d", model,
+               "-i", wav,
+               NULL);
+#endif
         _exit(1);
     }
 
@@ -179,8 +217,7 @@ int whisper(const char *wav, const char *model, int64_t target,
     long long last_edit = 0;
     int status = 0;
 
-    /* Read data as it is stremed by whisper.cpp, hoping it
-     * will not change output format. */
+    /* Read data as it is streamed by the selected ASR backend. */
     while (1) {
         /* Timeout check. */
         if (time(NULL) - start > TIMEOUT) {
@@ -337,17 +374,22 @@ void handleRequest(sqlite3 *dbhandle, BotRequest *br) {
 
     /* Select model based on queue length. */
     int qlen = atomic_load(&QueueLen);
-    const char *model = qlen >= QUEUE_THRESHOLD_BASE ? MODEL_BASE : MODEL_MEDIUM;
-    const char *mname = qlen >= QUEUE_THRESHOLD_BASE ? "base" : "medium";
+    const char *model = qlen >= QUEUE_THRESHOLD_FAST ? MODEL_FAST : MODEL_BEST;
+    const char *mname = qlen >= QUEUE_THRESHOLD_FAST ? MODEL_FAST_NAME : MODEL_BEST_NAME;
 
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Transcribing (%s)...", mname);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Transcribing (%s %s)...",
+             MODEL_BACKEND_NAME, mname);
     botEditMessageText(chat_id, msg_id, msg);
 
-    /* Run whisper, we pass the chat/msg ID since it will update
+    /* Run the model, we pass the chat/msg ID since it will update
      * the message with actual transcription. */
+#ifdef USE_WHISPER
     int short_audio = dur < SHORT_AUDIO_THRESHOLD;
-    whisper(out, model, br->target, chat_id, msg_id, short_audio);
+#else
+    int short_audio = 0;
+#endif
+    transcribe(out, model, br->target, chat_id, msg_id, short_audio);
 
     pthread_mutex_unlock(&WhisperLock);
     atomic_fetch_sub(&QueueLen, 1);
@@ -360,8 +402,8 @@ void cron(sqlite3 *dbhandle) {
 
 int main(int argc, char **argv) {
     static char *triggers[] = {"*", NULL};
-    printf("Whisper bot started. Queue max: %d, Audio max: %ds\n",
-           MAX_QUEUE, MAX_SECONDS);
+    printf("%s bot started. Queue max: %d, Audio max: %ds\n",
+           MODEL_BACKEND_NAME, MAX_QUEUE, MAX_SECONDS);
     startBot(TB_CREATE_KV_STORE, argc, argv, TB_FLAGS_NONE,
              handleRequest, cron, triggers);
     return 0;

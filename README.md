@@ -1,14 +1,14 @@
-# Whisper Bot - Telegram voice transcription bot
+# Whisper/Qwen3-ASR Bot - Telegram voice transcription bot
 
-This is a Telegram bot that transcribes voice messages using whisper.cpp. You send a voice message, it replies with the text. It's built on top of botlib and follows the same philosophy: simple C code, one thread per request, minimal dependencies.
+This is a Telegram bot that transcribes voice messages using either [whisper.cpp](https://github.com/ggml-org/whisper.cpp) or [qwen-asr](https://github.com/antirez/qwen-asr). You send a voice message, it replies with the text. It's built on top of botlib and follows the same philosophy: simple C code, one thread per request, minimal dependencies. **We suggest using the Qwen3_ASR model** and the linked Pure C inference implementation. Inference is much faster, and the quality very good.
 
-I wanted voice transcription in Telegram without sending my audio to external services. Whisper.cpp runs locally on my server, and the quality is quite good, much better than the Telegram bots I used so far to do the same task (especially using Whisper medium). The bot handles downloading the audio, converting it to the right format, running whisper, and streaming the result back to Telegram as it's being transcribed.
+The bot handles downloading audio, converting it to WAV, running the selected backend as an external process, and streaming the result back to Telegram as it's transcribed.
 
 ## How it works
 
-The bot uses botlib's thread-per-request model, but with a twist: since whisper.cpp is CPU/GPU-bound, running multiple instances in parallel makes no sense (in case of a small server, like most users would install this thing on). So threads wait their turn using a mutex. The queue length is tracked with a C11 atomic, and if too many requests pile up, the bot just tells you to try later instead of making everyone wait forever.
+The bot uses botlib's thread-per-request model, but with a twist: ASR is CPU-heavy, so running many transcriptions in parallel usually hurts latency/throughput on small servers. Threads wait their turn using a mutex. The queue length is tracked with a C11 atomic, and if too many requests pile up, the bot tells users to retry later.
 
-There's also a small optimization: when the queue is short, it uses the `medium` model for better quality. When the queue gets longer, it switches to the `base` model to clear the backlog faster. You can tune the threshold. Consider that for languages otehr than English the difference among base and medium is brutal.
+There's also a small optimization: when the queue is short, it uses the better model (`MODEL_BEST`). When the queue gets longer, it switches to the faster model (`MODEL_FAST`) to clear backlog faster.
 
 The transcription is streamed back to Telegram by editing the message as new text arrives. If the transcription is very long, it automatically continues in a new message (never tested in practice, so far...).
 
@@ -16,17 +16,26 @@ The transcription is streamed back to Telegram by editing the message as new tex
 
 * libcurl and libsqlite3 (for botlib)
 * ffmpeg (for audio conversion)
-* whisper.cpp (you need to build it separately)
+* one ASR backend binary:
+  * `whisper.cpp` (`whisper-cli`), or
+  * `qwen_asr` from antirez
 
 ## Installation
 
-1. Build whisper.cpp and download at least the `base` and `medium` models.
+1. Build both ASR backends (or at least the one you want to use), and download their models.
 
-2. Edit `whisperbot.c` and fix the paths at the top:
+2. Edit `whisperbot.c` and select exactly one backend:
 ```c
-#define WHISPER_PATH "/path/to/whisper.cpp/main"
-#define MODEL_BASE "/path/to/whisper.cpp/models/ggml-base.bin"
-#define MODEL_MEDIUM "/path/to/whisper.cpp/models/ggml-medium.bin"
+// #define USE_WHISPER
+#define USE_QWEN3_ASR
+```
+
+Then set backend-specific paths in the matching block:
+
+```c
+#define ASR_BIN_PATH "..."
+#define MODEL_FAST "..."
+#define MODEL_BEST "..."
 ```
 
 3. Create your bot with [@BotFather](https://t.me/botfather) and save the API key in `apikey.txt`.
@@ -47,23 +56,20 @@ Everything is at the top of `whisperbot.c`:
 #define MAX_QUEUE 10            // Max pending requests before rejecting
 #define MAX_SECONDS 300         // Max audio duration (5 minutes)
 #define MSG_LIMIT 4000          // Telegram message length limit
-#define TIMEOUT 600             // Kill whisper after 10 minutes
-#define QUEUE_THRESHOLD_BASE 3  // Use base model when queue >= this
-#define SHORT_AUDIO_THRESHOLD 1.5  // Seconds, below this use DEFAULT_LANG
-#define DEFAULT_LANG "it"       // Language for short audio
+#define TIMEOUT 600             // Kill ASR process after 10 minutes
+#define QUEUE_THRESHOLD_FAST 3  // Use MODEL_FAST when queue >= this
 ```
 
-## Short audio and language detection
+Whisper-only knobs in the `USE_WHISPER` block:
 
-Whisper.cpp has trouble with very short audio clips (under ~1.5 seconds): it either fails silently or the auto language detection picks the wrong language. For example, the Italian "Sì ok" gets transcribed as the English "See you K".
+```c
+#define SHORT_AUDIO_THRESHOLD 1.5
+#define DEFAULT_LANG "it"
+```
 
-To work around this, the bot pads short audio with silence to reach 1.5 seconds, and uses a fixed language (`DEFAULT_LANG`, defaulting to Italian) instead of auto-detection. For longer audio, auto-detection works fine.
-
-If you primarily use a different language, change `DEFAULT_LANG` in the configuration.
-Note that even when the message is in English, and we default to the wrong language because of duration, the effect is that the message is often transcribed correctly, but it gets automatically translated.
+`SHORT_AUDIO_THRESHOLD` and `DEFAULT_LANG` are used only by Whisper.
 
 ## Limitations
 
-* The paths to whisper.cpp are hardcoded (edit and recompile).
+* Backend and model paths are hardcoded (edit and recompile).
 * No persistence: if you restart the bot, queued requests are lost.
-* Short audio uses a fixed language instead of auto-detection (see above, no simple workaround AFAIK).
