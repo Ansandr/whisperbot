@@ -313,6 +313,7 @@ void handleRequest(sqlite3 *dbhandle, BotRequest *br) {
     if (br->file_type == TB_FILE_TYPE_VOICE_OGG) is_audio = 1;
     if (br->file_type == TB_FILE_TYPE_AUDIO) is_audio = 1;
     if (br->file_type == TB_FILE_TYPE_DOCUMENT && isAudioFile(br)) is_audio = 1;
+    if (br->file_type == TB_FILE_TYPE_VIDEO_NOTE) is_audio = 1;
     if (!is_audio) return;
 
     /* Temp file names. Fixed extension - ffmpeg detects format from content,

@@ -779,6 +779,14 @@ int64_t botProcessUpdates(int64_t offset, int timeout) {
             br->file_name = name ? sdsnew(name->valuestring) : NULL;
         }
 
+        cJSON *video_note = cJSON_Select(msg,".video_note.file_id:s");
+        if (video_note) {
+            br->file_type = TB_FILE_TYPE_VIDEO_NOTE;
+            br->file_id = sdsnew(video_note->valuestring);
+            cJSON *size = cJSON_Select(msg,".video_note.file_size:n");
+            br->file_size = size ? size->valuedouble : 0;
+        }
+
         /* Parse entities, filling the mentions array. */
         cJSON *entities = cJSON_Select(msg,".entities[0]");
         while(entities) {
